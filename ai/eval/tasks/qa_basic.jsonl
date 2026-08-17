@@ -1,0 +1,5 @@
+{"id": "capital-france", "prompt": "What is the capital of France?", "expected": "Paris", "keywords": ["Paris"]}
+{"id": "sum-2-2", "prompt": "What is 2 + 2?", "expected": "4", "keywords": ["4"]}
+{"id": "http-def", "prompt": "In one sentence, what does HTTP stand for?", "keywords": ["HyperText", "Transfer", "Protocol"]}
+{"id": "list-primes", "prompt": "List the first three prime numbers.", "keywords": ["2", "3", "5"]}
+{"id": "python-typed", "prompt": "Is Python a statically typed or dynamically typed language?", "keywords": ["dynamically"]}
