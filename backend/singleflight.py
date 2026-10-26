@@ -21,8 +21,7 @@ T = TypeVar("T")
 
 @dataclass
 class _Flight(Generic[T]):
-    future: asyncio.Future[T]
-    callers: int = 1
+    task: asyncio.Task[T] | None = None
 
 
 class SingleFlight(Generic[T]):
@@ -41,7 +40,7 @@ class SingleFlight(Generic[T]):
         Returns `(result, is_shared)` where `is_shared` is True if this invocation
         shared an already-running flight.
         """
-        flight: _Flight[T] | None = None
+        flight: _Flight[T]
         is_initiator = False
 
         async with self._lock:
@@ -49,32 +48,37 @@ class SingleFlight(Generic[T]):
             if key in self._flights:
                 self.shared_calls += 1
                 flight = self._flights[key]
-                flight.callers += 1
             else:
-                loop = asyncio.get_running_loop()
-                flight = _Flight(future=loop.create_future(), callers=1)
+                flight = _Flight()
                 self._flights[key] = flight
+                flight.task = asyncio.create_task(self._run_flight(key, flight, fn))
+                flight.task.add_done_callback(self._consume_task_result)
                 is_initiator = True
 
-        if not is_initiator:
-            # Join existing flight
-            result = await flight.future
-            return result, True
+        # The worker task belongs to the flight, not to whichever caller created it.
+        # Shield every caller's wait so cancellation only affects that caller.
+        assert flight.task is not None
+        result = await asyncio.shield(flight.task)
+        return result, not is_initiator
 
-        # Initiator runs the worker function
+    async def _run_flight(
+        self,
+        key: str,
+        flight: _Flight[T],
+        fn: Callable[[], Awaitable[T]],
+    ) -> T:
         try:
-            res = await fn()
-            flight.future.set_result(res)
-            return res, False
-        except BaseException as exc:
-            if flight.callers > 1:
-                flight.future.set_exception(exc)
-            else:
-                flight.future.cancel()
-            raise
+            return await fn()
         finally:
             async with self._lock:
-                self._flights.pop(key, None)
+                if self._flights.get(key) is flight:
+                    del self._flights[key]
+
+    @staticmethod
+    def _consume_task_result(task: asyncio.Future[T]) -> None:
+        """Observe failures if every caller cancels before the flight completes."""
+        if not task.cancelled():
+            task.exception()
 
     @property
     def in_flight_count(self) -> int:
