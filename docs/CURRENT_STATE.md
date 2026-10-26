@@ -56,7 +56,7 @@ timestamps are left as printed by the command.
 | `python -m examples.quickstart` | passed | Exit `0`; produced a MockProvider completion, a cache hit, `Received 5 responses. Deduplicated in-flight: 4/5 (Provider called once)`, indexed 2 chunks from 2 documents, and returned a RAG result. Also passed with the three provider environment variables explicitly unset; see command/output below. |
 | `pytest -v` | passed | Three runs, each collected 40 items and ended `40 passed`; runtimes were `1.77s`, `0.71s`, and `0.85s`. No failures or skips. |
 | `python -m benchmarks.latency_bench` | passed | Three successful runs; full raw outputs below. |
-| `uvicorn backend.main:app --reload` (README) | passed | Server started without `--reload` on `127.0.0.1:8000`; requested routes returned responses. Both server runs were stopped with Ctrl-C and logged clean shutdown. Reload mode itself was not run. |
+| `uvicorn backend.main:app --reload` (README) | not verified | The server was started without `--reload` on `127.0.0.1:8000`; requested routes returned responses. Both server runs were stopped with Ctrl-C and logged clean shutdown. |
 | README Anthropic `curl` completion example | not verified | No real provider credentials/call used. |
 | README OpenAI-compatible `curl` completion example | not verified | No real provider credentials/call used. |
 | README Ollama/vLLM `OPENAI_BASE_URL` and `curl` example | not verified | No local external model endpoint was configured or called. |
