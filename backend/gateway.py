@@ -203,3 +203,7 @@ class Gateway:
 
     def circuit_breaker_states(self) -> dict[str, str]:
         return {name: cb.state.value for name, cb in self._circuit_breakers.items()}
+
+    async def aclose(self) -> None:
+        """Close the request batcher after flushing its accepted work."""
+        await self._batcher.aclose()
