@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
@@ -86,6 +88,15 @@ rag_pipeline.ingest([
     ),
 ])
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    try:
+        yield
+    finally:
+        await gateway.aclose()
+
+
 app = FastAPI(
     title="AI Systems Lab — Inference Gateway",
     version="1.1.0",
@@ -93,6 +104,7 @@ app = FastAPI(
         "An enterprise-grade, routed, cached, batched, and deduplicated inference gateway "
         "with circuit breaking, hybrid RAG, and live Prometheus observability."
     ),
+    lifespan=lifespan,
 )
 
 app.add_middleware(
