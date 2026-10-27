@@ -50,6 +50,7 @@ class CircuitBreaker(Generic[T]):
         self._consecutive_successes = 0
         self._last_state_change = time.monotonic()
         self._last_failure_time: float | None = None
+        self._half_open_probe_in_flight = False
         self._lock = asyncio.Lock()
 
     @property
@@ -68,15 +69,23 @@ class CircuitBreaker(Generic[T]):
 
     async def call(self, fn: Callable[[], Awaitable[T]]) -> T:
         """Execute `fn` guarded by the circuit breaker state machine."""
+        is_half_open_probe = False
         async with self._lock:
             current = self.state
             if current == CircuitState.OPEN:
                 raise CircuitOpenError(
                     f"Circuit breaker '{self.name}' is OPEN. Provider is temporarily unavailable."
                 )
-            if current == CircuitState.HALF_OPEN and self._state == CircuitState.OPEN:
-                self._state = CircuitState.HALF_OPEN
-                self._consecutive_successes = 0
+            if current == CircuitState.HALF_OPEN:
+                if self._half_open_probe_in_flight:
+                    raise CircuitOpenError(
+                        f"Circuit breaker '{self.name}' already has a HALF_OPEN probe in flight."
+                    )
+                if self._state == CircuitState.OPEN:
+                    self._state = CircuitState.HALF_OPEN
+                    self._consecutive_successes = 0
+                self._half_open_probe_in_flight = True
+                is_half_open_probe = True
 
         try:
             result = await fn()
@@ -85,6 +94,13 @@ class CircuitBreaker(Generic[T]):
         except Exception as exc:
             await self._on_failure(exc)
             raise
+        finally:
+            if is_half_open_probe:
+                await self._release_half_open_probe()
+
+    async def _release_half_open_probe(self) -> None:
+        async with self._lock:
+            self._half_open_probe_in_flight = False
 
     async def _on_success(self) -> None:
         async with self._lock:
