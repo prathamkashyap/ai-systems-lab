@@ -169,6 +169,38 @@ docker compose -f infrastructure/docker-compose.yml up --build
 | `/metrics/prometheus` | GET | Prometheus text exposition scrape format |
 | `/docs` | GET | Interactive OpenAPI documentation |
 
+### API input validation
+
+These limits apply in both `developer` and `public-demo` modes:
+
+| Input | Accepted boundary |
+|---|---|
+| Completion prompt | Non-whitespace text, at most 8,000 characters |
+| Message content | Non-whitespace text, at most 8,000 characters per message |
+| Message collection | 1–32 messages, using the existing system/user/assistant roles |
+| Explicit HTTP batch | 1–16 valid completion requests |
+| Retrieval query | Non-whitespace text, at most 2,000 characters |
+| Retrieval `top_k` | Integer from 1 to 20, default 5 |
+| Retrieval mode | `hybrid`, `vector`, or `bm25` |
+
+Supply exactly one non-null `prompt` or `messages` input. Supplying both is
+rejected rather than silently choosing one. Empty message lists are rejected;
+an unused input may be omitted or explicitly `null`. Valid text is preserved
+without trimming. Lengths count characters, not bytes or model tokens.
+
+Pydantic validates completions, messages, and every explicit batch member before
+the endpoint runs. FastAPI validates retrieval parameters before search. Invalid
+requests return HTTP 422, including on the streaming endpoint before SSE starts.
+One invalid batch member rejects the entire HTTP batch without executing any of
+its members. Direct construction of these Pydantic request models also validates
+their inputs. Success response schemas and generation-parameter bounds are unchanged.
+
+The limits accommodate the quickstart and playground while bounding individual
+application inputs. The explicit HTTP batch limit is separate from micro-batcher
+queue capacity. Global body limits, concurrent execution/admission, queue bounds,
+deadlines, and per-client rate limiting remain separate work. Direct use of the
+retrieval library is not governed by the HTTP query constraints.
+
 ## Benchmark Summary
 
 > [!NOTE]

@@ -156,9 +156,11 @@ async def create_batch_completion(req: BatchCompletionRequest) -> BatchCompletio
 
 @app.get("/v1/rag/search")
 async def rag_search(
-    query: str = Query(..., description="Search query string"),
+    query: str = Query(
+        ..., min_length=1, max_length=2000, pattern=r"\S", description="Search query string"
+    ),
     mode: Literal["hybrid", "vector", "bm25"] = "hybrid",
-    top_k: int = 5,
+    top_k: int = Query(5, ge=1, le=20),
 ) -> list[dict]:
     results = rag_pipeline.query(query, top_k=top_k, mode=mode)
     return [{"text": r.text, "score": round(r.score, 4), "metadata": r.metadata} for r in results]

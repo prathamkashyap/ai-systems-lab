@@ -2,26 +2,46 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
-    content: str
+    content: str = Field(min_length=1, max_length=8000)
+
+    @field_validator("content")
+    @classmethod
+    def require_meaningful_content(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Message content must contain non-whitespace text")
+        return value
 
 
 class CompletionRequest(BaseModel):
     """A single completion request accepted by the gateway."""
 
-    prompt: str | None = None
-    messages: list[Message] | None = None
+    prompt: str | None = Field(default=None, min_length=1, max_length=8000)
+    messages: list[Message] | None = Field(default=None, min_length=1, max_length=32)
     model: str = Field(default="mock-small", description="Logical model name")
     max_tokens: int = Field(default=256, ge=1, le=8192)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     cache: bool = Field(default=True, description="Allow serving from / writing to cache")
     stream: bool = Field(default=False, description="Stream response tokens via SSE")
+
+    @field_validator("prompt")
+    @classmethod
+    def require_meaningful_prompt(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("Prompt must contain non-whitespace text")
+        return value
+
+    @model_validator(mode="after")
+    def require_one_input(self) -> Self:
+        if (self.prompt is None) == (self.messages is None):
+            raise ValueError("Provide exactly one of prompt or messages")
+        return self
 
     def as_messages(self) -> list[Message]:
         if self.messages:
@@ -52,7 +72,7 @@ class StreamChunk(BaseModel):
 
 
 class BatchCompletionRequest(BaseModel):
-    requests: list[CompletionRequest]
+    requests: list[CompletionRequest] = Field(min_length=1, max_length=16)
 
 
 class BatchCompletionResponse(BaseModel):
