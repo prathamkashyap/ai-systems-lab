@@ -6,9 +6,13 @@ and metrics collection.
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 
+from backend.admission import AdmissionBudget, AdmittedStream
 from backend.batching import MicroBatcher
 from backend.cache import TTLLRUCache
 from backend.circuit_breaker import CircuitBreaker, CircuitOpenError
@@ -32,12 +36,16 @@ class Gateway:
         max_batch_size: int = 16,
         circuit_failure_threshold: int = 3,
         circuit_recovery_timeout: float = 10.0,
+        admission: AdmissionBudget | None = None,
     ) -> None:
         if not providers:
             raise ValueError("Gateway requires at least one provider")
         self.providers = providers
         self.cache = cache or TTLLRUCache()
         self.metrics = metrics or MetricsRegistry()
+        self.admission = admission
+        self._uncached_keys = itertools.count()
+        self._close_lock = asyncio.Lock()
         self._singleflight: SingleFlight[CompletionResponse] = SingleFlight()
         self._circuit_breakers: dict[str, CircuitBreaker] = {
             p.name: CircuitBreaker(
@@ -68,6 +76,8 @@ class Gateway:
         submitting into the micro-batcher so concurrent identical requests
         coalesce without duplicate downstream work.
         """
+        if self.admission is not None:
+            return (await self.complete_many([req]))[0]
         start = time.perf_counter()
         if req.cache:
             key = self._cache_key(req)
@@ -98,6 +108,64 @@ class Gateway:
             return resp
 
         return await self._batcher.submit(req)
+
+    async def complete_many(self, requests: list[CompletionRequest]) -> list[CompletionResponse]:
+        """Atomically admit a public HTTP batch's new downstream work."""
+        if self.admission is None:
+            return list(await asyncio.gather(*(self.complete(req) for req in requests)))
+
+        request_permit = self.admission.reserve_request()
+        try:
+            start = time.perf_counter()
+            cached = [
+                self.cache.get(self._cache_key(req), record_stats=False) if req.cache else None
+                for req in requests
+            ]
+            permits = iter(())
+
+            def reserve(count: int) -> None:
+                nonlocal permits
+                permits = iter(self.admission.reserve_work(count))
+
+            async def work(req: CompletionRequest) -> CompletionResponse:
+                permit = next(permits)
+                try:
+                    await permit.ready
+                    return await self._batcher.submit(req)
+                finally:
+                    permit.release()
+
+            calls = [
+                (
+                    self._cache_key(req) if req.cache else f"uncached:{next(self._uncached_keys)}",
+                    lambda req=req: work(req),
+                )
+                for req, hit in zip(requests, cached, strict=True) if hit is None
+            ]
+            prepared = await self._singleflight.prepare_many(calls, before_start=reserve)
+            for req, hit in zip(requests, cached, strict=True):
+                if req.cache:
+                    self.cache.record_lookup(hit is not None)
+            # Shield each flight: cancellation ends this waiter, not accepted
+            # background work or its execution reservation.
+            results = iter(await asyncio.gather(*(asyncio.shield(task) for task, _ in prepared)))
+            flags = iter(shared for _, shared in prepared)
+            responses = []
+            for req, hit in zip(requests, cached, strict=True):
+                shared = False if hit is not None else next(flags)
+                response = hit if hit is not None else next(results)
+                if hit is not None or (req.cache and shared):
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    response = response.model_copy(update={
+                        "cached": True, "deduplicated": shared, "latency_ms": elapsed_ms,
+                    })
+                    self.metrics.record_request(
+                        response.provider, elapsed_ms, cached=True, deduplicated=shared
+                    )
+                responses.append(response)
+            return responses
+        finally:
+            request_permit.release()
 
 
     async def _execute_batch(self, requests: list[CompletionRequest]) -> list[CompletionResponse]:
@@ -165,6 +233,18 @@ class Gateway:
         )
 
     async def stream_complete(self, req: CompletionRequest) -> AsyncIterator[str]:
+        stream = self.open_stream(req)
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            await stream.aclose()
+
+    def open_stream(self, req: CompletionRequest) -> AdmittedStream:
+        """Reserve before headers; the caller must close the returned stream."""
+        return AdmittedStream(self._stream_complete(req), self.admission)
+
+    async def _stream_complete(self, req: CompletionRequest) -> AsyncGenerator[str, None]:
         """Stream token chunks across providers with fallback."""
         messages = req.as_messages()
         last_error: Exception | None = None
@@ -175,13 +255,14 @@ class Gateway:
                 continue
 
             try:
-                async for chunk in provider.stream_complete(
+                async with aclosing(provider.stream_complete(
                     messages,
                     model=req.model,
                     max_tokens=req.max_tokens,
                     temperature=req.temperature,
-                ):
-                    yield chunk
+                )) as chunks:
+                    async for chunk in chunks:
+                        yield chunk
                 return
             except Exception as exc:  # noqa: BLE001 - try next provider
                 last_error = exc
@@ -206,4 +287,10 @@ class Gateway:
 
     async def aclose(self) -> None:
         """Close the request batcher after flushing its accepted work."""
-        await self._batcher.aclose()
+        if self.admission is not None:
+            async with self._close_lock:
+                await self.admission.close_streams()
+                await self._singleflight.wait_idle()
+                await self._batcher.aclose()
+        else:
+            await self._batcher.aclose()

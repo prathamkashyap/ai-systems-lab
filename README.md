@@ -122,8 +122,58 @@ constructed `Gateway` instances remain configured by their caller.
 For a future Render deployment, supply `AI_SYSTEMS_LAB_MODE=public-demo` as a
 service environment variable before startup. The Docker image accepts this
 variable at runtime. Keep real provider credentials out of public deployments.
-This mode enforces mock-only inference; admission limits, resource limits, rate
-limiting, and the deployment configuration remain separate work.
+This mode enforces mock-only inference and the admission budgets below. Global
+body limits, deadlines, rate limiting, and deployment remain separate work.
+
+### Public-demo admission budgets
+
+These per-process settings are read at application startup and forwarded by Compose:
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `AI_SYSTEMS_LAB_MAX_ACTIVE` | 4 | Maximum active downstream work reservations; positive integer |
+| `AI_SYSTEMS_LAB_MAX_PENDING` | 16 | Maximum pending completion work items; nonnegative integer |
+| `AI_SYSTEMS_LAB_MAX_REQUESTS` | 64 | Maximum concurrent inference request waiters, including duplicate joins and streams; positive integer |
+
+Public mode admits at most `MAX_ACTIVE + MAX_PENDING` unique downstream work
+items. Four active reservations and sixteen pending items conservatively bound
+a small demonstration; these defaults are not a measured hosting-capacity claim.
+Invalid or empty limit values fail startup without echoing their values. Developer
+mode ignores these settings and preserves its existing unbounded behavior.
+
+Admission occurs after validation and cache inspection, before new SingleFlight
+workers or micro-batcher submissions are started. Cache hits use no downstream
+reservation. Existing SingleFlight joins share a flight's reservation, but each
+HTTP request still consumes one waiter slot. An explicit HTTP batch uses one
+waiter slot and atomically reserves the new work its members represent: cached
+members and existing/duplicate flights need no additional execution reservations.
+If the group cannot fit, no new member starts and no join is registered.
+
+An active completion reservation covers micro-batcher waiting and batch-wide
+result delivery as well as actual provider execution. Multiple flushes may still
+run concurrently, but total active work stays bounded. Flush size is not queue
+capacity, and grouping still makes individual provider calls. Pending items wait
+in a bounded FIFO; there is no unbounded semaphore waiting population.
+
+Streams do not queue: they need an active reservation before SSE headers are sent
+and hold it through response completion, error, or disconnect, including pauses
+between chunks. Overload never evicts an accepted stream. Cancelling a completion
+caller releases its waiter slot, but its accepted independent work continues and
+keeps its execution reservation until finished. Shutdown stops admission, closes
+streams, and drains accepted completion flights before closing the batcher. Without
+deadlines, a stalled operation can still occupy its bounded slot indefinitely.
+
+Overload returns HTTP **503** with JSON
+`{"error":{"code":"capacity_unavailable","message":"Public demo is busy"}}`.
+Saturated streams receive that response before SSE begins. Rejected work does not
+call providers, update cache hit/miss counters, or count as provider failure or
+successful execution. No `Retry-After` time is guessed: availability depends on
+work completion, and clients should not run automatic retry loops.
+
+These limits cover inference work inside one application process, not socket
+connections, request parsing/body buffering, retrieval, or aggregate multi-worker
+capacity. Keep the public demo undeployed until the remaining public-safety gates
+are complete. See [ADR 0006](system-design/adr/0006-public-demo-admission.md).
 
 ### With Real Model Providers
 
