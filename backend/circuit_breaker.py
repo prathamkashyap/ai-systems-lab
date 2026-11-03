@@ -68,7 +68,7 @@ class CircuitBreaker(Generic[T]):
         return self.state != CircuitState.OPEN
 
     async def call(self, fn: Callable[[], Awaitable[T]]) -> T:
-        """Execute `fn` guarded by the circuit breaker state machine."""
+        """Execute `fn` under the breaker; caller cancellation is not a failure."""
         is_half_open_probe = False
         async with self._lock:
             current = self.state

@@ -30,6 +30,28 @@ async def test_circuit_breaker_closed_under_normal_operation():
     assert cb.state == CircuitState.CLOSED
 
 
+async def test_cancelled_closed_call_does_not_count_as_provider_failure():
+    cb = CircuitBreaker[str](name="test", failure_threshold=1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_operation():
+        started.set()
+        await release.wait()
+        return "cancelled result"
+
+    call = asyncio.create_task(cb.call(blocked_operation))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(call, timeout=1)
+
+    assert cb.state == CircuitState.CLOSED
+    assert cb._consecutive_failures == 0
+    assert await asyncio.wait_for(cb.call(lambda: asyncio.sleep(0, result="ok")), timeout=1) == "ok"
+    assert cb.state == CircuitState.CLOSED
+
+
 async def test_circuit_breaker_trips_to_open_after_failures():
     cb = CircuitBreaker[str](name="test", failure_threshold=2, recovery_timeout=0.05)
 
