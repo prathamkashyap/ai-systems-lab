@@ -28,6 +28,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 
+from backend.config import build_providers
 from backend.gateway import Gateway, NoProviderAvailable
 from backend.models import (
     BatchCompletionRequest,
@@ -37,14 +38,13 @@ from backend.models import (
     HealthResponse,
     MetricsSnapshot,
 )
-from backend.providers import AnthropicProvider, MockProvider, OpenAIProvider
 from data.pipeline import Document, RetrievalPipeline
 
 _START_TIME = time.monotonic()
 _STATIC_DIR = Path(__file__).parent / "static"
 
-# Register providers in priority order: Anthropic -> OpenAI -> Mock fallback
-gateway = Gateway(providers=[AnthropicProvider(), OpenAIProvider(), MockProvider()])
+# Enforce the application mode before any live provider can be constructed.
+gateway = Gateway(providers=build_providers())
 
 # Pre-seeded RAG knowledge base for interactive exploration
 rag_pipeline = RetrievalPipeline(dim=256, chunk_size=80)
