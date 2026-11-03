@@ -94,6 +94,37 @@ uvicorn backend.main:app --reload
 # -> Open http://localhost:8000/docs for Swagger OpenAPI docs
 ```
 
+### Public mock-only playground mode
+
+Set the application mode before starting the server:
+
+```bash
+AI_SYSTEMS_LAB_MODE=public-demo uvicorn backend.main:app --host 0.0.0.0 --port 8000
+
+# The Compose service forwards the same setting into the container.
+AI_SYSTEMS_LAB_MODE=public-demo docker compose -f infrastructure/docker-compose.yml up --build
+```
+
+In `public-demo` mode the application constructs and registers **only MockProvider**.
+Anthropic and OpenAI credentials and `OPENAI_BASE_URL` cannot activate external
+inference providers, even if accidentally present. Completion, batch completion,
+and streaming requests use mock output; `/health` lists only the mock provider.
+Requests naming real models also produce explicitly labeled mock output; the
+requested model name is preserved in the response. No real model is loaded or called.
+
+Unset mode or `AI_SYSTEMS_LAB_MODE=developer` preserves the existing developer
+configuration: Anthropic, OpenAI-compatible, then Mock providers, with the existing
+model-selection rules. Any other value, including an empty string, fails startup.
+Mode is read when `backend.main` is imported; restart the server to change it.
+This setting controls the HTTP application's provider construction; independently
+constructed `Gateway` instances remain configured by their caller.
+
+For a future Render deployment, supply `AI_SYSTEMS_LAB_MODE=public-demo` as a
+service environment variable before startup. The Docker image accepts this
+variable at runtime. Keep real provider credentials out of public deployments.
+This mode enforces mock-only inference; admission limits, resource limits, rate
+limiting, and the deployment configuration remain separate work.
+
 ### With Real Model Providers
 
 Set environment variables and the gateway automatically routes matching requests to live APIs:
