@@ -16,7 +16,6 @@ Endpoints:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -26,9 +25,10 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
-from backend.config import build_providers
+from backend.admission import AdmissionRejected
+from backend.config import build_admission, build_providers
 from backend.gateway import Gateway, NoProviderAvailable
 from backend.models import (
     BatchCompletionRequest,
@@ -44,7 +44,7 @@ _START_TIME = time.monotonic()
 _STATIC_DIR = Path(__file__).parent / "static"
 
 # Enforce the application mode before any live provider can be constructed.
-gateway = Gateway(providers=build_providers())
+gateway = Gateway(providers=build_providers(), admission=build_admission())
 
 # Pre-seeded RAG knowledge base for interactive exploration
 rag_pipeline = RetrievalPipeline(dim=256, chunk_size=80)
@@ -115,6 +115,30 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(AdmissionRejected)
+async def admission_rejected_handler(request, exc) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"code": "capacity_unavailable", "message": "Public demo is busy"}},
+    )
+
+
+class _AdmittedStreamingResponse(StreamingResponse):
+    def __init__(self, content, stream):
+        super().__init__(content, media_type="text/event-stream")
+        self.stream = stream
+
+    async def __call__(self, scope, receive, send):
+        try:
+            self.stream.start()
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                await self.body_iterator.aclose()
+            finally:
+                await self.stream.aclose()
+
+
 @app.post("/v1/completions", response_model=CompletionResponse)
 async def create_completion(req: CompletionRequest) -> CompletionResponse:
     try:
@@ -127,9 +151,12 @@ async def create_completion(req: CompletionRequest) -> CompletionResponse:
 
 @app.post("/v1/completions/stream")
 async def create_streaming_completion(req: CompletionRequest) -> StreamingResponse:
+    # Reserve before StreamingResponse can send a successful status. No stream
+    # task is started when capacity is unavailable.
+    stream = gateway.open_stream(req)
     async def event_generator():
         try:
-            async for token in gateway.stream_complete(req):
+            async for token in stream:
                 chunk_data = json.dumps({"text": token, "model": req.model})
                 yield f"data: {chunk_data}\n\n"
             yield "data: [DONE]\n\n"
@@ -138,14 +165,14 @@ async def create_streaming_completion(req: CompletionRequest) -> StreamingRespon
             yield f"data: {err_data}\n\n"
 
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return _AdmittedStreamingResponse(event_generator(), stream)
 
 
 @app.post("/v1/completions/batch", response_model=BatchCompletionResponse)
 async def create_batch_completion(req: BatchCompletionRequest) -> BatchCompletionResponse:
     start = time.perf_counter()
     try:
-        responses = await asyncio.gather(*(gateway.complete(r) for r in req.requests))
+        responses = await gateway.complete_many(req.requests)
     except NoProviderAvailable as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     total_ms = (time.perf_counter() - start) * 1000

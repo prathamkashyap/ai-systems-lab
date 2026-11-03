@@ -8,6 +8,9 @@ services:
     environment:
       # Set public-demo to register only MockProvider, regardless of credentials.
       - AI_SYSTEMS_LAB_MODE=${AI_SYSTEMS_LAB_MODE-developer}
+      - AI_SYSTEMS_LAB_MAX_ACTIVE=${AI_SYSTEMS_LAB_MAX_ACTIVE-4}
+      - AI_SYSTEMS_LAB_MAX_PENDING=${AI_SYSTEMS_LAB_MAX_PENDING-16}
+      - AI_SYSTEMS_LAB_MAX_REQUESTS=${AI_SYSTEMS_LAB_MAX_REQUESTS-64}
       # Optional: set to enable live provider backends. Without them the
       # gateway still runs fully end-to-end via MockProvider.
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}

@@ -40,26 +40,45 @@ class SingleFlight(Generic[T]):
         Returns `(result, is_shared)` where `is_shared` is True if this invocation
         shared an already-running flight.
         """
-        flight: _Flight[T]
-        is_initiator = False
+        [(task, shared)] = await self.prepare_many([(key, fn)])
+        return await asyncio.shield(task), shared
 
+    async def prepare_many(
+        self,
+        calls: list[tuple[str, Callable[[], Awaitable[T]]]],
+        before_start: Callable[[int], None] | None = None,
+    ) -> list[tuple[asyncio.Task[T], bool]]:
+        """Atomically reserve new work before starting or joining any flights.
+
+        The synchronous hook may reject the whole group without task or counter
+        changes. Workers belong to flights; callers must shield their waits.
+        """
         async with self._lock:
-            self.total_calls += 1
-            if key in self._flights:
-                self.shared_calls += 1
-                flight = self._flights[key]
-            else:
-                flight = _Flight()
-                self._flights[key] = flight
-                flight.task = asyncio.create_task(self._run_flight(key, flight, fn))
-                flight.task.add_done_callback(self._consume_task_result)
-                is_initiator = True
+            new_keys = {key for key, _ in calls if key not in self._flights}
+            if before_start is not None:
+                before_start(len(new_keys))
+            prepared = []
+            for key, fn in calls:
+                self.total_calls += 1
+                shared = key in self._flights
+                if shared:
+                    self.shared_calls += 1
+                    flight = self._flights[key]
+                else:
+                    flight = _Flight()
+                    self._flights[key] = flight
+                    flight.task = asyncio.create_task(self._run_flight(key, flight, fn))
+                    flight.task.add_done_callback(self._consume_task_result)
+                assert flight.task is not None
+                prepared.append((flight.task, shared))
+            return prepared
 
-        # The worker task belongs to the flight, not to whichever caller created it.
-        # Shield every caller's wait so cancellation only affects that caller.
-        assert flight.task is not None
-        result = await asyncio.shield(flight.task)
-        return result, not is_initiator
+    async def wait_idle(self) -> None:
+        """Drain a snapshot after the owner has stopped new admission."""
+        async with self._lock:
+            tasks = [flight.task for flight in self._flights.values() if flight.task is not None]
+        if tasks:
+            await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
 
     async def _run_flight(
         self,

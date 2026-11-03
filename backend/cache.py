@@ -41,19 +41,25 @@ class TTLLRUCache:
         raw = "\x1f".join(parts)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def get(self, key: str) -> Any | None:
+    def get(self, key: str, *, record_stats: bool = True) -> Any | None:
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
-                self.misses += 1
+                self.misses += int(record_stats)
                 return None
             if entry.expires_at < time.monotonic():
                 del self._store[key]
-                self.misses += 1
+                self.misses += int(record_stats)
                 return None
             self._store.move_to_end(key)
-            self.hits += 1
+            self.hits += int(record_stats)
             return entry.value
+
+    def record_lookup(self, hit: bool) -> None:
+        """Record an admission-time lookup only after work has been accepted."""
+        with self._lock:
+            self.hits += int(hit)
+            self.misses += int(not hit)
 
     def set(self, key: str, value: Any) -> None:
         with self._lock:
