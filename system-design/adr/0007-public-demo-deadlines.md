@@ -32,6 +32,18 @@ releasing its work permit. Observers use bounded waits; unfinished cleanup retai
 its reservation. Public HTTP timeout is sanitized 504 before headers, or one terminal
 SSE error after headers with no subsequent success marker.
 
+An `aclose()` exception is not proof of termination. After a finalization failure,
+release execution capacity only if the owned provider step has finished and all
+owned native async generators have no execution frames. Gateway records provider
+iterators as well as its wrapper: a closed wrapper can hide an unterminated provider
+iterator after a nested close error. Finalize bookkeeping and report a
+sanitized `StreamFinalizationError`; shutdown continues closing other streams.
+If generator termination cannot be established (including non-native iterators),
+retain the work reservation and stream ownership, fail admission closed, and report
+`ShutdownIncomplete`. Cleanup cancels its obsolete deadline timer when it starts.
+The response owner finalizes its waiter reservation even if cleanup fails. Repeated
+close calls observe the same cleanup result and never reopen failed admission.
+
 Stop admission synchronously at shutdown. One shielded shutdown task closes streams
 and drains work for 5s. On grace expiry, error queued work, cancel running flushes,
 and observe all owned tasks for 1s. A nonterminating task causes fail-closed admission

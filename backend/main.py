@@ -30,7 +30,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 
 from backend.admission import AdmissionRejected
 from backend.config import build_admission, build_providers
-from backend.deadlines import InferenceDeadlineExceeded, ShutdownIncomplete, observe, settled
+from backend.deadlines import (
+    InferenceDeadlineExceeded,
+    ShutdownIncomplete,
+    StreamFinalizationError,
+    observe,
+    settled,
+)
 from backend.gateway import Gateway, NoProviderAvailable
 from backend.models import (
     BatchCompletionRequest,
@@ -163,8 +169,8 @@ class _AdmittedStreamingResponse(StreamingResponse):
             self.stream._expire()
             try:
                 await self.stream.aclose()
-            except ShutdownIncomplete:
-                pass  # keep the execution reservation; admission is failed closed
+            except (ShutdownIncomplete, StreamFinalizationError):
+                pass  # cleanup classified ownership; emit only the sanitized timeout
 
             async def terminal():
                 if headers_sent:
@@ -187,9 +193,10 @@ class _AdmittedStreamingResponse(StreamingResponse):
             finally:
                 try:
                     await self.stream.aclose()
-                except ShutdownIncomplete:
+                except (ShutdownIncomplete, StreamFinalizationError):
                     pass
-                self.stream.finish_response()
+                finally:
+                    self.stream.finish_response()
 
 
 @app.post("/v1/completions", response_model=CompletionResponse)

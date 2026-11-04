@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator
 
-from backend.deadlines import InferenceDeadlineExceeded, ShutdownIncomplete, observe, settled
+from backend.deadlines import (
+    InferenceDeadlineExceeded,
+    ShutdownIncomplete,
+    StreamFinalizationError,
+    observe,
+    settled,
+)
 
 
 class AdmissionRejected(RuntimeError):
@@ -93,7 +100,7 @@ class AdmissionBudget:
     def fail_closed(self) -> None:
         self.closing = True
         logging.getLogger(__name__).critical(
-            "Inference cancellation cleanup exceeded its bound; supervisor termination required"
+            "Inference cleanup failed or exceeded its bound; supervisor termination required"
         )
 
     def expire_pending(self) -> None:
@@ -142,14 +149,23 @@ class AdmissionBudget:
         if owners:
             await asyncio.gather(*owners, return_exceptions=True)
         for stream in streams:
-            await stream.aclose()
+            try:
+                await stream.aclose()
+            except StreamFinalizationError:
+                # Termination and bookkeeping completed; continue draining the
+                # other streams. The cleanup owner already logged this failure.
+                pass
 
 
 class AdmittedStream(AsyncIterator[str]):
     """Own a stream reservation through iteration and response termination."""
 
-    def __init__(self, iterator: AsyncGenerator[str, None], budget: AdmissionBudget | None) -> None:
+    def __init__(
+        self, iterator: AsyncGenerator[str, None], budget: AdmissionBudget | None, *,
+        owned_iterators: list[AsyncIterator[str]] | None = None,
+    ) -> None:
         self.iterator = iterator
+        self._owned_iterators = owned_iterators if owned_iterators is not None else []
         self.budget = budget
         self.owner: asyncio.Task | None = None
         self.request: RequestPermit | None = None
@@ -185,14 +201,41 @@ class AdmittedStream(AsyncIterator[str]):
     async def _cleanup(self) -> None:
         # This tracked owner retains capacity if cancellation is resisted.
         # Observers (including shutdown) always use bounded waits on this task.
-        if self._step_task is not None:
-            if not self._step_task.done():
-                self._step_task.cancel()
-            await asyncio.gather(self._step_task, return_exceptions=True)
-        await self.iterator.aclose()
-        self.closed = True
         if self._timer is not None:
             self._timer.cancel()
+        try:
+            if self._step_task is not None:
+                if not self._step_task.done():
+                    self._step_task.cancel()
+                await asyncio.gather(self._step_task, return_exceptions=True)
+            await self.iterator.aclose()
+            if self._owned_iterators and not self._execution_stopped():
+                # The wrapper may have swallowed a nested close error during
+                # iteration. Its successful aclose alone is insufficient.
+                raise ShutdownIncomplete()
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001 - classify arbitrary finalizer failures
+            if self._execution_stopped():
+                self._finish_cleanup()
+                logging.getLogger(__name__).warning(
+                    "Stream finalization failed after its owned generator terminated"
+                )
+                raise StreamFinalizationError() from None
+            self.budget.fail_closed()
+            if not self.response_owned:
+                self.finish_response()
+            raise ShutdownIncomplete() from None
+        self._finish_cleanup()
+
+    def _execution_stopped(self) -> bool:
+        """Require both the step task and every owned generator to terminate."""
+        return (self._step_task is None or self._step_task.done()) and all(
+            inspect.isasyncgen(iterator) and iterator.ag_frame is None
+            for iterator in (self.iterator, *self._owned_iterators)
+        )
+
+    def _finish_cleanup(self) -> None:
+        """Release only after the owned execution is conclusively stopped."""
+        self.closed = True
         if self.work is not None:
             self.work.release()
         if not self.response_owned or self.request.released:

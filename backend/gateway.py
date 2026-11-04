@@ -275,9 +275,15 @@ class Gateway:
 
     def open_stream(self, req: CompletionRequest) -> AdmittedStream:
         """Reserve before headers; the caller must close the returned stream."""
-        return AdmittedStream(self._stream_complete(req), self.admission)
+        owned_iterators = [] if self.admission is not None else None
+        return AdmittedStream(
+            self._stream_complete(req, owned_iterators), self.admission,
+            owned_iterators=owned_iterators,
+        )
 
-    async def _stream_complete(self, req: CompletionRequest) -> AsyncGenerator[str, None]:
+    async def _stream_complete(
+        self, req: CompletionRequest, owned_iterators: list[AsyncIterator[str]] | None = None,
+    ) -> AsyncGenerator[str, None]:
         """Stream token chunks across providers with fallback."""
         messages = req.as_messages()
         last_error: Exception | None = None
@@ -288,12 +294,15 @@ class Gateway:
                 continue
 
             try:
-                async with aclosing(provider.stream_complete(
+                chunks = provider.stream_complete(
                     messages,
                     model=req.model,
                     max_tokens=req.max_tokens,
                     temperature=req.temperature,
-                )) as chunks:
+                )
+                if owned_iterators is not None:
+                    owned_iterators.append(chunks)
+                async with aclosing(chunks):
                     async for chunk in chunks:
                         yield chunk
                 return
