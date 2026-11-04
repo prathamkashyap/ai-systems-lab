@@ -122,8 +122,8 @@ constructed `Gateway` instances remain configured by their caller.
 For a future Render deployment, supply `AI_SYSTEMS_LAB_MODE=public-demo` as a
 service environment variable before startup. The Docker image accepts this
 variable at runtime. Keep real provider credentials out of public deployments.
-This mode enforces mock-only inference and the admission budgets below. Global
-body limits, deadlines, rate limiting, and deployment remain separate work.
+This mode enforces mock-only inference, admission budgets, and the deadlines below.
+Global body limits, rate limiting, and deployment remain separate work.
 
 ### Public-demo admission budgets
 
@@ -160,8 +160,8 @@ and hold it through response completion, error, or disconnect, including pauses
 between chunks. Overload never evicts an accepted stream. Cancelling a completion
 caller releases its waiter slot, but its accepted independent work continues and
 keeps its execution reservation until finished. Shutdown stops admission, closes
-streams, and drains accepted completion flights before closing the batcher. Without
-deadlines, a stalled operation can still occupy its bounded slot indefinitely.
+streams, and drains accepted completion flights before closing the batcher, within
+the deadline and cancellation policy below.
 
 Overload returns HTTP **503** with JSON
 `{"error":{"code":"capacity_unavailable","message":"Public demo is busy"}}`.
@@ -174,6 +174,70 @@ These limits cover inference work inside one application process, not socket
 connections, request parsing/body buffering, retrieval, or aggregate multi-worker
 capacity. Keep the public demo undeployed until the remaining public-safety gates
 are complete. See [ADR 0006](system-design/adr/0006-public-demo-admission.md).
+
+### Public-demo deadlines and shutdown
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `AI_SYSTEMS_LAB_WORK_TIMEOUT_S` | 10 seconds | Lifetime of newly admitted work, including pending and micro-batcher residence |
+| `AI_SYSTEMS_LAB_STREAM_TIMEOUT_S` | 15 seconds | Total stream lifetime from reservation, including response sending |
+| `AI_SYSTEMS_LAB_SHUTDOWN_GRACE_S` | 5 seconds | Application drain grace after admission stops |
+| `AI_SYSTEMS_LAB_CANCEL_GRACE_S` | 1 second | Bounded observation of cancellation cleanup |
+
+Durations must be finite and positive. Developer mode ignores these settings;
+its existing inference and application-close behavior remains unchanged. Work
+deadlines use the event loop's monotonic clock. Joiners inherit the existing
+flight's deadline; joining or cancelling a caller cannot reset or cancel it.
+
+A normal request exceeding its work deadline returns HTTP **504**:
+`{"error":{"code":"inference_deadline_exceeded","message":"Inference deadline exceeded"}}`.
+Before stream headers the same error is HTTP 504. After headers, a timeout sends
+one terminal SSE `event: error` with that JSON in `data`, then closes without
+`[DONE]`. A disconnected or unresponsive client may not receive the terminal event.
+
+Queued expiry removes the item without provider execution. Expiry of any member
+of an executing flush cancels the entire flush, errors unresolved member futures,
+and prevents later sequential calls in that flush. Results from an expired flush
+are not cached or recorded as successes. This preserves batch-wide failure semantics.
+
+**A timeout response does not itself release execution capacity.** The actual
+batch task owns release after provider execution ends. Stream cleanup has the
+same ownership rule. If a provider takes time to unwind cancellation, its slot
+remains occupied. If it exceeds the cancellation grace, the process fails admission
+closed, retains unfinished execution reservations, and requires operator restart.
+
+Shutdown stops admission immediately, terminates streams, and drains completion
+work for the configured grace. At grace expiry it errors pending work and signals
+running flushes to cancel, then observes cleanup for the cancellation grace.
+Cooperative cleanup returns work/request counters to zero. Incomplete cleanup
+raises a sanitized shutdown error; it does not claim the provider stopped. Concurrent
+close callers share one shielded shutdown operation, so cancelling a close waiter
+does not abandon that operation.
+
+**Public process-stop policy:** run uvicorn with
+`--timeout-graceful-shutdown 6` (or `UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN=6`) and
+configure the container/supervisor to send SIGKILL after 15 seconds from SIGTERM.
+With defaults, the budget is 6 seconds server request drain + 5 seconds application
+drain + 1 second cancellation cleanup, with remaining supervisor margin. Compose
+forwards the optional uvicorn setting and uses `stop_grace_period: 15s`; for the
+public profile start it with:
+
+```bash
+AI_SYSTEMS_LAB_MODE=public-demo UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN=6 \
+  docker compose -f infrastructure/docker-compose.yml up --build
+```
+
+If durations are increased, increase the supervisor stop budget accordingly.
+Cancellation-resistant code or a blocked event loop cannot be killed safely by
+an asyncio timeout. The host supervisor must enforce process termination; an
+application error or restart policy alone is insufficient. The Compose stop grace
+also applies in developer mode, but its uvicorn setting remains opt-in. This is
+not a deployment: the future hosting task must verify the platform's hard-stop
+behavior before exposing the demo. Uvicorn drains HTTP tasks before application
+shutdown; expiry of its own request-drain limit can interrupt a response (including
+HTTP 500), even though the application subsequently cleans up owned provider work.
+The 504/SSE contract describes inference deadlines while the response is still
+available. See [ADR 0007](system-design/adr/0007-public-demo-deadlines.md).
 
 ### With Real Model Providers
 

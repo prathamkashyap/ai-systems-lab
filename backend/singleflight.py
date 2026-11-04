@@ -80,6 +80,10 @@ class SingleFlight(Generic[T]):
         if tasks:
             await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
 
+    def owned_tasks(self) -> set[asyncio.Task]:
+        """Single-loop snapshot for bounded shutdown observation."""
+        return {flight.task for flight in self._flights.values() if flight.task is not None}
+
     async def _run_flight(
         self,
         key: str,

@@ -16,6 +16,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -29,6 +30,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 
 from backend.admission import AdmissionRejected
 from backend.config import build_admission, build_providers
+from backend.deadlines import (
+    InferenceDeadlineExceeded,
+    ShutdownIncomplete,
+    StreamFinalizationError,
+    observe,
+    settled,
+)
 from backend.gateway import Gateway, NoProviderAvailable
 from backend.models import (
     BatchCompletionRequest,
@@ -123,20 +131,72 @@ async def admission_rejected_handler(request, exc) -> JSONResponse:
     )
 
 
+_TIMEOUT_ERROR = {"error": {
+    "code": "inference_deadline_exceeded", "message": "Inference deadline exceeded"
+}}
+
+
+@app.exception_handler(InferenceDeadlineExceeded)
+async def inference_timeout_handler(request, exc) -> JSONResponse:
+    return JSONResponse(status_code=504, content=_TIMEOUT_ERROR)
+
+
 class _AdmittedStreamingResponse(StreamingResponse):
     def __init__(self, content, stream):
         super().__init__(content, media_type="text/event-stream")
         self.stream = stream
+        self.stream.response_owned = True
 
     async def __call__(self, scope, receive, send):
+        headers_sent = False
+
+        async def tracked_send(message):
+            nonlocal headers_sent
+            await send(message)
+            if message["type"] == "http.response.start":
+                headers_sent = True
+
         try:
             self.stream.start()
-            await super().__call__(scope, receive, send)
+            if self.stream.deadline is None:
+                await super().__call__(scope, receive, tracked_send)
+            else:
+                async with asyncio.timeout_at(self.stream.deadline):
+                    await super().__call__(scope, receive, tracked_send)
+        except (TimeoutError, InferenceDeadlineExceeded):
+            if self.stream.budget is None:
+                raise
+            self.stream._expire()
+            try:
+                await self.stream.aclose()
+            except (ShutdownIncomplete, StreamFinalizationError):
+                pass  # cleanup classified ownership; emit only the sanitized timeout
+
+            async def terminal():
+                if headers_sent:
+                    await send({"type": "http.response.body", "body": (
+                        "event: error\ndata: " + json.dumps(_TIMEOUT_ERROR) + "\n\n"
+                    ).encode(), "more_body": False})
+                else:
+                    await JSONResponse(status_code=504, content=_TIMEOUT_ERROR)(scope, receive, send)
+
+            sender = asyncio.create_task(terminal())
+            sender.add_done_callback(observe)
+            self.stream.budget._response_tasks.add(sender)
+            sender.add_done_callback(self.stream.budget._response_tasks.discard)
+            if not await settled({sender}, self.stream.budget.cancel_grace_s):
+                sender.cancel()
+                self.stream.budget.fail_closed()
         finally:
             try:
                 await self.body_iterator.aclose()
             finally:
-                await self.stream.aclose()
+                try:
+                    await self.stream.aclose()
+                except (ShutdownIncomplete, StreamFinalizationError):
+                    pass
+                finally:
+                    self.stream.finish_response()
 
 
 @app.post("/v1/completions", response_model=CompletionResponse)
@@ -160,8 +220,11 @@ async def create_streaming_completion(req: CompletionRequest) -> StreamingRespon
                 chunk_data = json.dumps({"text": token, "model": req.model})
                 yield f"data: {chunk_data}\n\n"
             yield "data: [DONE]\n\n"
+        except InferenceDeadlineExceeded:
+            raise  # response owner emits one terminal error, never [DONE]
         except Exception as exc:  # noqa: BLE001
-            err_data = json.dumps({"error": str(exc)})
+            err_data = json.dumps({"error": "Inference failed"} if gateway.admission is not None
+                                  else {"error": str(exc)})
             yield f"data: {err_data}\n\n"
 
 

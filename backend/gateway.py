@@ -16,6 +16,7 @@ from backend.admission import AdmissionBudget, AdmittedStream
 from backend.batching import MicroBatcher
 from backend.cache import TTLLRUCache
 from backend.circuit_breaker import CircuitBreaker, CircuitOpenError
+from backend.deadlines import InferenceDeadlineExceeded, ShutdownIncomplete, observe, settled
 from backend.metrics import MetricsRegistry
 from backend.models import CompletionRequest, CompletionResponse, Message
 from backend.providers.base import Provider
@@ -45,7 +46,7 @@ class Gateway:
         self.metrics = metrics or MetricsRegistry()
         self.admission = admission
         self._uncached_keys = itertools.count()
-        self._close_lock = asyncio.Lock()
+        self._shutdown_task: asyncio.Task | None = None
         self._singleflight: SingleFlight[CompletionResponse] = SingleFlight()
         self._circuit_breakers: dict[str, CircuitBreaker] = {
             p.name: CircuitBreaker(
@@ -59,6 +60,8 @@ class Gateway:
             batch_fn=self._execute_batch,
             max_batch_size=max_batch_size,
             window_ms=batch_window_ms,
+            cancel_grace_s=admission.cancel_grace_s if admission is not None else 1,
+            on_stuck=admission.fail_closed if admission is not None else None,
         )
 
     def _providers_for(self, model: str) -> list[Provider]:
@@ -122,18 +125,31 @@ class Gateway:
                 for req in requests
             ]
             permits = iter(())
+            reserved = []
 
             def reserve(count: int) -> None:
-                nonlocal permits
-                permits = iter(self.admission.reserve_work(count))
+                nonlocal permits, reserved
+                reserved = self.admission.reserve_work(count)
+                permits = iter(reserved)
 
             async def work(req: CompletionRequest) -> CompletionResponse:
                 permit = next(permits)
                 try:
-                    await permit.ready
-                    return await self._batcher.submit(req)
+                    try:
+                        async with asyncio.timeout_at(permit.deadline):
+                            await asyncio.shield(permit.ready)
+                    except TimeoutError:
+                        raise InferenceDeadlineExceeded() from None
+                    # The batcher now owns release, including on submit failure.
+                    # A failed/timed-out result is not evidence execution stopped.
+                    permit.transferred = True
+                    return await self._batcher.submit(
+                        req, deadline=permit.deadline, on_finish=permit.release,
+                        on_result=lambda response: self._record_result(req, response),
+                    )
                 finally:
-                    permit.release()
+                    if not permit.transferred:
+                        permit.release()
 
             calls = [
                 (
@@ -143,6 +159,14 @@ class Gateway:
                 for req, hit in zip(requests, cached, strict=True) if hit is None
             ]
             prepared = await self._singleflight.prepare_many(calls, before_start=reserve)
+            # Also release reservations if a newly created worker is cancelled
+            # before its coroutine has entered the try/finally above.
+            for (task, shared), permit in zip(
+                [(task, shared) for task, shared in prepared if not shared], reserved, strict=True
+            ):
+                task.add_done_callback(
+                    lambda task, permit=permit: None if permit.transferred else permit.release()
+                )
             for req, hit in zip(requests, cached, strict=True):
                 if req.cache:
                     self.cache.record_lookup(hit is not None)
@@ -171,6 +195,10 @@ class Gateway:
     async def _execute_batch(self, requests: list[CompletionRequest]) -> list[CompletionResponse]:
         results: list[CompletionResponse] = []
         for req in requests:
+            # A provider may swallow cancellation and return late. Do not let
+            # that start later members of an already terminated public flush.
+            if self.admission is not None and asyncio.current_task().cancelling():
+                raise InferenceDeadlineExceeded()
             results.append(await self._complete_one(req))
         return results
 
@@ -213,11 +241,8 @@ class Gateway:
                     input_tokens=in_tok,
                     output_tokens=out_tok,
                 )
-                self.metrics.record_request(
-                    provider.name, latency_ms, cached=False, deduplicated=False
-                )
-                if req.cache:
-                    self.cache.set(self._cache_key(req), response)
+                if self.admission is None:
+                    self._record_result(req, response)
                 return response
             except CircuitOpenError as exc:
                 self.metrics.record_circuit_trip()
@@ -232,6 +257,14 @@ class Gateway:
             f"No provider could serve model={req.model!r}: {last_error}"
         )
 
+    def _record_result(self, req: CompletionRequest, response: CompletionResponse) -> None:
+        """Commit public success only after the whole flush completes in time."""
+        self.metrics.record_request(
+            response.provider, response.latency_ms, cached=False, deduplicated=False
+        )
+        if req.cache:
+            self.cache.set(self._cache_key(req), response)
+
     async def stream_complete(self, req: CompletionRequest) -> AsyncIterator[str]:
         stream = self.open_stream(req)
         try:
@@ -242,9 +275,15 @@ class Gateway:
 
     def open_stream(self, req: CompletionRequest) -> AdmittedStream:
         """Reserve before headers; the caller must close the returned stream."""
-        return AdmittedStream(self._stream_complete(req), self.admission)
+        owned_iterators = [] if self.admission is not None else None
+        return AdmittedStream(
+            self._stream_complete(req, owned_iterators), self.admission,
+            owned_iterators=owned_iterators,
+        )
 
-    async def _stream_complete(self, req: CompletionRequest) -> AsyncGenerator[str, None]:
+    async def _stream_complete(
+        self, req: CompletionRequest, owned_iterators: list[AsyncIterator[str]] | None = None,
+    ) -> AsyncGenerator[str, None]:
         """Stream token chunks across providers with fallback."""
         messages = req.as_messages()
         last_error: Exception | None = None
@@ -255,12 +294,15 @@ class Gateway:
                 continue
 
             try:
-                async with aclosing(provider.stream_complete(
+                chunks = provider.stream_complete(
                     messages,
                     model=req.model,
                     max_tokens=req.max_tokens,
                     temperature=req.temperature,
-                )) as chunks:
+                )
+                if owned_iterators is not None:
+                    owned_iterators.append(chunks)
+                async with aclosing(chunks):
                     async for chunk in chunks:
                         yield chunk
                 return
@@ -288,9 +330,32 @@ class Gateway:
     async def aclose(self) -> None:
         """Close the request batcher after flushing its accepted work."""
         if self.admission is not None:
-            async with self._close_lock:
-                await self.admission.close_streams()
-                await self._singleflight.wait_idle()
-                await self._batcher.aclose()
+            self.admission.closing = True
+            if self._shutdown_task is None:
+                self._shutdown_task = asyncio.create_task(self._close_public())
+                self._shutdown_task.add_done_callback(observe)
+            await asyncio.shield(self._shutdown_task)
         else:
             await self._batcher.aclose()
+
+    async def _close_public(self) -> None:
+        async def drain() -> None:
+            await self.admission.close_streams()
+            await self._singleflight.wait_idle()
+            await self._batcher.aclose()
+
+        drainer = asyncio.create_task(drain())
+        drainer.add_done_callback(observe)
+        if (await settled({drainer}, self.admission.shutdown_grace_s)
+                and not drainer.cancelled() and drainer.exception() is None):
+            return
+        self.admission.expire_pending()
+        self._batcher.abort()
+        tasks = {drainer} | self._singleflight.owned_tasks() | self._batcher._batch_tasks | self._batcher._flush_tasks
+        tasks |= {stream._cleanup_task for stream in self.admission._streams if stream._cleanup_task is not None}
+        tasks |= self.admission._response_tasks
+        if not await settled(tasks, self.admission.cancel_grace_s):
+            self.admission.fail_closed()
+            drainer.cancel()
+            raise ShutdownIncomplete()
+        drainer.result()

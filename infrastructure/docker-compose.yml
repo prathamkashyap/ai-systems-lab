@@ -11,6 +11,12 @@ services:
       - AI_SYSTEMS_LAB_MAX_ACTIVE=${AI_SYSTEMS_LAB_MAX_ACTIVE-4}
       - AI_SYSTEMS_LAB_MAX_PENDING=${AI_SYSTEMS_LAB_MAX_PENDING-16}
       - AI_SYSTEMS_LAB_MAX_REQUESTS=${AI_SYSTEMS_LAB_MAX_REQUESTS-64}
+      - AI_SYSTEMS_LAB_WORK_TIMEOUT_S=${AI_SYSTEMS_LAB_WORK_TIMEOUT_S-10}
+      - AI_SYSTEMS_LAB_STREAM_TIMEOUT_S=${AI_SYSTEMS_LAB_STREAM_TIMEOUT_S-15}
+      - AI_SYSTEMS_LAB_SHUTDOWN_GRACE_S=${AI_SYSTEMS_LAB_SHUTDOWN_GRACE_S-5}
+      - AI_SYSTEMS_LAB_CANCEL_GRACE_S=${AI_SYSTEMS_LAB_CANCEL_GRACE_S-1}
+      # Set to 6 for the public profile; leave unset for existing developer behavior.
+      - UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN
       # Optional: set to enable live provider backends. Without them the
       # gateway still runs fully end-to-end via MockProvider.
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -23,3 +29,4 @@ services:
       timeout: 3s
       retries: 3
     restart: unless-stopped
+    stop_grace_period: 15s

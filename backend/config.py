@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 
 from backend.admission import AdmissionBudget
@@ -32,8 +33,21 @@ def build_admission() -> AdmissionBudget | None:
             raise ValueError(f"{name} must be an integer >= {minimum}")
         return int(raw)
 
+    def duration(name: str, default: float) -> float:
+        try:
+            value = float(os.environ.get(name, str(default)))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError
+            return value
+        except ValueError:
+            raise ValueError(f"{name} must be a finite positive duration in seconds") from None
+
     return AdmissionBudget(
         max_active=limit("AI_SYSTEMS_LAB_MAX_ACTIVE", 4, 1),
         max_pending=limit("AI_SYSTEMS_LAB_MAX_PENDING", 16, 0),
         max_requests=limit("AI_SYSTEMS_LAB_MAX_REQUESTS", 64, 1),
+        work_timeout_s=duration("AI_SYSTEMS_LAB_WORK_TIMEOUT_S", 10),
+        stream_timeout_s=duration("AI_SYSTEMS_LAB_STREAM_TIMEOUT_S", 15),
+        shutdown_grace_s=duration("AI_SYSTEMS_LAB_SHUTDOWN_GRACE_S", 5),
+        cancel_grace_s=duration("AI_SYSTEMS_LAB_CANCEL_GRACE_S", 1),
     )
