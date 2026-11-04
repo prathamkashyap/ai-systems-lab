@@ -122,8 +122,61 @@ constructed `Gateway` instances remain configured by their caller.
 For a future Render deployment, supply `AI_SYSTEMS_LAB_MODE=public-demo` as a
 service environment variable before startup. The Docker image accepts this
 variable at runtime. Keep real provider credentials out of public deployments.
-This mode enforces mock-only inference, admission budgets, and the deadlines below.
-Global body limits, rate limiting, and deployment remain separate work.
+This mode enforces mock-only inference, admission budgets, inference deadlines,
+and the HTTP ingress policy below. Rate limiting and deployment remain separate work.
+
+### Public-demo HTTP ingress
+
+`AI_SYSTEMS_LAB_MAX_BODY_BYTES` defaults to **262144 bytes (256 KiB)** in public-demo
+mode. Configure an ASCII decimal integer from **1 to 1048576 bytes (1 MiB)** before
+startup. Empty, invalid, nonpositive, and larger values fail startup with a sanitized
+configuration error. Developer mode ignores this variable and retains its existing
+body handling and wildcard CORS behavior. Docker/Compose accept the same setting.
+
+The default accommodates the playground, an 8,000-character UTF-8 prompt, a full
+ASCII message collection, and a 16-member ASCII prompt batch. Bytes differ from
+Pydantic's character limits: a model-valid batch can still exceed the aggregate
+body budget, especially with multibyte text or JSON escaping. Split such requests
+into smaller batches rather than assuming all field maxima fit together.
+
+All public HTTP routes count actual ASGI body bytes before JSON/Pydantic parsing,
+gateway admission, retrieval, or provider execution. Bodies exactly at the limit
+remain eligible for normal validation. Oversized bodies return HTTP **413**:
+
+```json
+{"error":{"code":"request_too_large","message":"Request body too large"}}
+```
+
+A declared oversized `Content-Length` is rejected without reading the body.
+Missing lengths and transfer-decoded chunked bodies are still counted. Underreported
+lengths cannot bypass the byte budget. Malformed lengths, duplicate lengths (even
+identical ones), combined `Content-Length`/`Transfer-Encoding`, and completed bodies
+whose byte counts disagree with the declared length return HTTP **400**:
+`{"error":{"code":"invalid_content_length","message":"Invalid Content-Length"}}`.
+If actual bytes exceed the budget, 413 takes precedence over a length mismatch.
+Decimal lengths may include surrounding spaces/tabs and leading zeros.
+Server-level wire-framing errors occur before this middleware and use the HTTP
+server's own response format.
+
+The ASGI boundary buffers only an accepted body's configured byte budget, checking
+each chunk before appending. It stops receiving at the first overflow and never
+starts the application for a rejected body. This bounded pre-read also protects
+GET routes that do not consume bodies themselves. A bounded copy is needed for
+replay; the server's already-received chunk and downstream parsing allocations are
+separate. No reader tasks are spawned, and the original disconnect channel remains
+available to SSE after the accepted body is replayed.
+
+The public playground uses same-origin URLs, so public mode grants **no cross-origin
+CORS permissions**. Cross-origin preflights receive 405 and responses have no
+`Access-Control-Allow-Origin` or credential permission headers. Same-origin HTTP
+and SSE continue normally. CORS controls browser response access; it is not
+authentication and does not prevent direct HTTP clients from calling the API.
+
+This is a per-request body bound, not a total process-memory or connection budget.
+Upload deadlines, aggregate ingress concurrency, header limits, and per-client rate
+limits are not supplied by this middleware. HTTP wire framing is handled by the
+ASGI server. Keep the demo undeployed until the remaining public-safety gates are
+complete. See [ADR 0008](system-design/adr/0008-public-http-ingress.md).
 
 ### Public-demo admission budgets
 
@@ -311,9 +364,9 @@ their inputs. Success response schemas and generation-parameter bounds are uncha
 
 The limits accommodate the quickstart and playground while bounding individual
 application inputs. The explicit HTTP batch limit is separate from micro-batcher
-queue capacity. Global body limits, concurrent execution/admission, queue bounds,
-deadlines, and per-client rate limiting remain separate work. Direct use of the
-retrieval library is not governed by the HTTP query constraints.
+queue capacity and the public HTTP body-byte budget. Public-demo admission and
+deadline policies are described above; per-client rate limiting remains separate
+work. Direct use of the retrieval library is not governed by HTTP query constraints.
 
 ## Benchmark Summary
 
