@@ -169,17 +169,72 @@ replay; the server's already-received chunk and downstream parsing allocations a
 separate. No reader tasks are spawned, and the original disconnect channel remains
 available to SSE after the accepted body is replayed.
 
+Public mode also bounds the **upload-reading phase**, per process:
+
+| Setting | Default | Allowed range |
+|---|---:|---:|
+| `AI_SYSTEMS_LAB_MAX_BODY_READERS` | 8 | integer 1–64 |
+| `AI_SYSTEMS_LAB_BODY_TIMEOUT_S` | 5 seconds | finite 0.1–30 seconds |
+
+Both are startup settings; invalid/empty values fail with sanitized errors.
+Developer mode ignores them. Compose forwards the same settings. Eight readers
+allow ordinary interactive requests to overlap while limiting simultaneous body
+accumulation; five seconds is a conservative upload allowance for the 256 KiB
+default and the playground's small JSON requests. It is not a measured network SLA.
+
+After validating declared length, ingress reserves a reader slot synchronously
+without queuing. Exhaustion returns **503**, with no speculative `Retry-After`:
+`{"error":{"code":"ingress_capacity_unavailable","message":"Request ingress is busy"}}`.
+All routes, including empty-body requests and exact `GET /health`, need a slot.
+Health can return ingress 503 while uploads saturate the process; its rate-limit
+exemption cannot be used to hold unlimited slow readers.
+
+One absolute monotonic deadline begins at reservation. Missing lengths, chunked
+bodies, partial progress, and empty frames cannot restart it. Expiration returns
+**408**: `{"error":{"code":"request_timeout","message":"Request body timed out"}}`.
+Deadline checks also run around receives, and the loop yields for ready/empty
+frames. A body completed strictly before the deadline remains eligible for
+validation; a body observed at or after it times out. These responses precede
+downstream execution and never include submitted content.
+
+The ASGI request task owns the original receive and its slot. The slot releases
+in `finally` after reading/length validation unwinds, including oversize, malformed
+framing, disconnect, exception, timeout and cancellation paths. No reader tasks or
+semaphore waiters are created. A complete bounded body transfers to replay before
+downstream execution. The upload timeout ends there: inference and SSE continue
+under their separate budgets, and SSE retains the original disconnect channel.
+In particular, an accepted SSE response may outlive its upload deadline.
+
+Precedence is **rate 429 → declared-length 400/413 → reader-capacity 503 → timed
+body reading → application validation/inference**. During reading, deadline expiry
+is checked before processing a received chunk; otherwise byte overflow returns
+413 before a completed-length mismatch returns 400. Accepted downstream requests
+retain inference 503/504 behavior. Rejected ingress does not reserve inference
+capacity, execute retrieval/providers, or update inference execution metrics.
+
 The public playground uses same-origin URLs, so public mode grants **no cross-origin
-CORS permissions**. Rate-admitted cross-origin preflights receive 405 and responses have no
-`Access-Control-Allow-Origin` or credential permission headers. Same-origin HTTP
+CORS permissions**. Rate- and ingress-admitted cross-origin preflights receive 405;
+responses have no `Access-Control-Allow-Origin` or credential permission headers. Same-origin HTTP
 and SSE continue normally. CORS controls browser response access; it is not
 authentication and does not prevent direct HTTP clients from calling the API.
 
-This is a per-request body bound, not a total process-memory or connection budget.
-Upload deadlines, aggregate ingress concurrency, and header limits are not supplied
-by the body middleware. Request frequency is handled separately below. HTTP wire framing is handled by the
-ASGI server. Keep the demo undeployed until the remaining public-safety gates are
-complete. See [ADR 0008](system-design/adr/0008-public-http-ingress.md).
+This bounds concurrent upload accumulation, not total process memory or sockets.
+At the defaults, eight uploads can each accumulate up to 256 KiB; bytearray
+allocation overhead, bounded replay copies, server buffers and downstream parsing
+or response lifetimes are additional. Completed bodies may remain downstream after
+their reader slots release. Worker/instance counts multiply these per-process
+budgets. Request frequency is handled separately below.
+
+Timeout cancellation requires a cooperative ASGI receive/event loop. If receive
+suppresses cancellation while cleanup runs, it retains its slot until unwinding;
+no detached receive is declared finished. Middleware cannot forcibly terminate
+uncooperative Python code or a blocked event loop. A supervisor must terminate an
+unresponsive process. Connection/socket concurrency, slow headers before ASGI
+dispatch, header limits, proxy buffering/disconnect behavior and server/proxy
+upload safeguards remain deployment requirements. HTTP wire framing is handled by
+the ASGI server. Keep the demo undeployed until the remaining public-safety gates
+are complete. See [ADR 0008](system-design/adr/0008-public-http-ingress.md) and
+[ADR 0010](system-design/adr/0010-public-upload-bounds.md).
 
 ### Public-demo request-rate limits
 

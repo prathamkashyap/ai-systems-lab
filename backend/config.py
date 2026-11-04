@@ -6,6 +6,7 @@ import math
 import os
 
 from backend.admission import AdmissionBudget
+from backend.ingress import MAX_BODY_READERS, MAX_BODY_TIMEOUT_S, MIN_BODY_TIMEOUT_S
 from backend.providers import AnthropicProvider, MockProvider, OpenAIProvider, Provider
 from backend.rate_limit import (
     MAX_BURST,
@@ -17,6 +18,33 @@ from backend.rate_limit import (
 
 DEFAULT_MAX_BODY_BYTES = 262144
 MAX_CONFIGURED_BODY_BYTES = 1048576
+
+
+def build_body_read_limits() -> tuple[int, float] | None:
+    """Bound the upload phase only, independently of inference and SSE ownership."""
+    mode = os.environ.get("AI_SYSTEMS_LAB_MODE", "developer")
+    if mode == "developer":
+        return None
+    if mode != "public-demo":
+        raise ValueError("AI_SYSTEMS_LAB_MODE must be 'developer' or 'public-demo'")
+    name = "AI_SYSTEMS_LAB_MAX_BODY_READERS"
+    try:
+        raw = os.environ.get(name, "8")
+        if not raw.isascii() or not raw.isdecimal():
+            raise ValueError
+        readers = int(raw)
+        if not 1 <= readers <= MAX_BODY_READERS:
+            raise ValueError
+    except ValueError:
+        raise ValueError(f"{name} must be an integer between 1 and 64") from None
+    name = "AI_SYSTEMS_LAB_BODY_TIMEOUT_S"
+    try:
+        timeout = float(os.environ.get(name, "5"))
+        if not math.isfinite(timeout) or not MIN_BODY_TIMEOUT_S <= timeout <= MAX_BODY_TIMEOUT_S:
+            raise ValueError
+    except ValueError:
+        raise ValueError(f"{name} must be finite and between 0.1 and 30 seconds") from None
+    return readers, timeout
 
 
 def build_rate_limiter() -> TokenBucketLimiter | None:

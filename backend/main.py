@@ -29,7 +29,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from backend.admission import AdmissionRejected
-from backend.config import build_admission, build_body_limit, build_providers, build_rate_limiter
+from backend.config import (
+    build_admission,
+    build_body_limit,
+    build_body_read_limits,
+    build_providers,
+    build_rate_limiter,
+)
 from backend.deadlines import (
     InferenceDeadlineExceeded,
     ShutdownIncomplete,
@@ -55,6 +61,7 @@ _STATIC_DIR = Path(__file__).parent / "static"
 
 # Enforce the application mode before any live provider can be constructed.
 _MAX_BODY_BYTES = build_body_limit()
+_BODY_READ_LIMITS = build_body_read_limits()
 _RATE_LIMITER = build_rate_limiter()
 gateway = Gateway(providers=build_providers(), admission=build_admission())
 
@@ -128,7 +135,10 @@ if _MAX_BODY_BYTES is None:
     )
 else:
     # The public playground is same-origin; grant no cross-origin permissions.
-    app.add_middleware(BodyLimitMiddleware, max_body_bytes=_MAX_BODY_BYTES)
+    app.add_middleware(
+        BodyLimitMiddleware, max_body_bytes=_MAX_BODY_BYTES,
+        max_body_readers=_BODY_READ_LIMITS[0], body_timeout_s=_BODY_READ_LIMITS[1],
+    )
 if _RATE_LIMITER is not None:
     # Starlette inserts at index zero: last registered runs before body reading.
     app.add_middleware(RateLimitMiddleware, limiter=_RATE_LIMITER)
