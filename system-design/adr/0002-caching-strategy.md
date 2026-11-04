@@ -14,8 +14,9 @@ CI.
 ## Decision
 Implement `TTLLRUCache` (`backend/cache.py`) as a single in-process
 `OrderedDict`:
-- **Key:** SHA-256 of `(model, temperature, max_tokens, role:content...)`,
-  so any change to the request that could change the output changes the key.
+- **Key:** SHA-256 of one versioned JSON envelope of effective provider inputs:
+  model, full validated temperature, max_tokens and ordered role/content messages.
+  See the key-encoding correction below; user fields are not delimiter-flattened.
 - **TTL:** entries expire after a configurable window (default 5 minutes),
   checked lazily on read.
 - **LRU:** once `max_size` is reached, the least-recently-used entry is
@@ -47,3 +48,37 @@ Implement `TTLLRUCache` (`backend/cache.py`) as a single in-process
   survive a restart and doesn't share state across multiple gateway
   instances. A multi-instance deployment would need Redis or similar behind
   the same `get`/`set` interface.
+
+## Key-encoding correction
+
+The original gateway rounded temperatures to three decimal places and flattened
+messages with the cache utility's unit separator. Distinct valid provider inputs
+could therefore share both a response-cache entry and a SingleFlight execution.
+These were serialization collisions, not SHA-256 cryptographic collisions.
+
+`Gateway._cache_key` now hashes a single JSON string with explicit fields
+`format="ai-systems-lab.inference.v1"`, `model`, `temperature`, `max_tokens` and
+`messages`. Each message has its own `role` and `content`, in original order.
+Python's JSON encoder uses `sort_keys=True`, compact separators, `ensure_ascii=True`
+and `allow_nan=False`. Validated floats are serialized without decimal rounding,
+including their signed-zero representation. Unicode/control characters are escaped
+reversibly; content is never stripped or Unicode-normalized. This is a defined
+Python JSON format, not a claim of RFC 8785 cross-language canonicalization.
+
+Inputs pass through `as_messages()`, so prompt shorthand and an equivalent user
+message share a key. Cache/stream flags do not change the arguments passed to
+`Provider.complete()` and are excluded. Cache-disabled calls still bypass cache
+reads/writes and do not join cached flights. Model, message boundaries/order/roles,
+exact contents, token limit and full temperature remain distinct key inputs.
+
+A length-prefixed binary encoding could also remove ambiguity, but requires a
+custom format without improving this small process-local use case. JSON provides
+explicit, inspectable structure with the standard library. `TTLLRUCache.make_key`
+remains unchanged: the gateway supplies only one complete payload, avoiding any
+effect on unrelated multipart callers. Raw content is hashed, not used as a
+dictionary key or logged. Existing field/body limits remain unchanged.
+
+TTL/LRU, accounting, response flags, cancellation isolation and admission ownership
+are unchanged. Entries are process-local and disappear on restart; the new encoding
+requires no persistent-cache migration. Future changes to effective provider inputs
+must update this envelope and its format version as appropriate.

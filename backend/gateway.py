@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import aclosing
@@ -69,10 +70,23 @@ class Gateway:
         return matching or self.providers
 
     def _cache_key(self, req: CompletionRequest) -> str:
-        messages = req.as_messages()
-        parts = [req.model, f"{req.temperature:.3f}", f"{req.max_tokens}"]
-        parts += [f"{m.role}:{m.content}" for m in messages]
-        return self.cache.make_key(*parts)
+        # Hash one versioned envelope, never delimiter-flattened user fields.
+        # Use effective provider inputs so prompt shorthand and user messages
+        # remain equivalent, while float precision and message boundaries survive.
+        payload = json.dumps(
+            {
+                "format": "ai-systems-lab.inference.v1",
+                "model": req.model,
+                "temperature": req.temperature,
+                "max_tokens": req.max_tokens,
+                "messages": [
+                    {"role": message.role, "content": message.content}
+                    for message in req.as_messages()
+                ],
+            },
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+        )
+        return self.cache.make_key(payload)
 
     async def complete(self, req: CompletionRequest) -> CompletionResponse:
         """Public entry point: checks cache and in-flight deduplicator before
