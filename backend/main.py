@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from backend.admission import AdmissionRejected
-from backend.config import build_admission, build_body_limit, build_providers
+from backend.config import build_admission, build_body_limit, build_providers, build_rate_limiter
 from backend.deadlines import (
     InferenceDeadlineExceeded,
     ShutdownIncomplete,
@@ -47,6 +47,7 @@ from backend.models import (
     HealthResponse,
     MetricsSnapshot,
 )
+from backend.rate_limit import RateLimitMiddleware
 from data.pipeline import Document, RetrievalPipeline
 
 _START_TIME = time.monotonic()
@@ -54,6 +55,7 @@ _STATIC_DIR = Path(__file__).parent / "static"
 
 # Enforce the application mode before any live provider can be constructed.
 _MAX_BODY_BYTES = build_body_limit()
+_RATE_LIMITER = build_rate_limiter()
 gateway = Gateway(providers=build_providers(), admission=build_admission())
 
 # Pre-seeded RAG knowledge base for interactive exploration
@@ -127,6 +129,9 @@ if _MAX_BODY_BYTES is None:
 else:
     # The public playground is same-origin; grant no cross-origin permissions.
     app.add_middleware(BodyLimitMiddleware, max_body_bytes=_MAX_BODY_BYTES)
+if _RATE_LIMITER is not None:
+    # Starlette inserts at index zero: last registered runs before body reading.
+    app.add_middleware(RateLimitMiddleware, limiter=_RATE_LIMITER)
 
 
 @app.exception_handler(AdmissionRejected)

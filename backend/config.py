@@ -7,9 +7,50 @@ import os
 
 from backend.admission import AdmissionBudget
 from backend.providers import AnthropicProvider, MockProvider, OpenAIProvider, Provider
+from backend.rate_limit import (
+    MAX_BURST,
+    MAX_CLIENTS,
+    MAX_REFILL_PER_S,
+    MIN_REFILL_PER_S,
+    TokenBucketLimiter,
+)
 
 DEFAULT_MAX_BODY_BYTES = 262144
 MAX_CONFIGURED_BODY_BYTES = 1048576
+
+
+def build_rate_limiter() -> TokenBucketLimiter | None:
+    """Public request frequency is separate from downstream inference admission."""
+    mode = os.environ.get("AI_SYSTEMS_LAB_MODE", "developer")
+    if mode == "developer":
+        return None
+    if mode != "public-demo":
+        raise ValueError("AI_SYSTEMS_LAB_MODE must be 'developer' or 'public-demo'")
+
+    def integer(name: str, default: int, maximum: int) -> int:
+        try:
+            raw = os.environ.get(name, str(default))
+            if not raw.isascii() or not raw.isdecimal():
+                raise ValueError
+            value = int(raw)
+            if not 1 <= value <= maximum:
+                raise ValueError
+            return value
+        except ValueError:
+            raise ValueError(f"{name} must be an integer between 1 and {maximum}") from None
+
+    name = "AI_SYSTEMS_LAB_RATE_REFILL_PER_S"
+    try:
+        refill = float(os.environ.get(name, "2"))
+        if not math.isfinite(refill) or not MIN_REFILL_PER_S <= refill <= MAX_REFILL_PER_S:
+            raise ValueError
+    except ValueError:
+        raise ValueError(f"{name} must be finite and between 0.01 and 10") from None
+    return TokenBucketLimiter(
+        burst=integer("AI_SYSTEMS_LAB_RATE_BURST", 60, MAX_BURST),
+        refill_per_s=refill,
+        max_clients=integer("AI_SYSTEMS_LAB_RATE_MAX_CLIENTS", 1024, MAX_CLIENTS),
+    )
 
 
 def build_body_limit() -> int | None:
