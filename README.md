@@ -99,10 +99,13 @@ uvicorn backend.main:app --reload
 Set the application mode before starting the server:
 
 ```bash
-AI_SYSTEMS_LAB_MODE=public-demo uvicorn backend.main:app --host 0.0.0.0 --port 8000
+AI_SYSTEMS_LAB_MODE=public-demo uvicorn backend.main:app --host 0.0.0.0 --port 8000 \
+  --no-proxy-headers --timeout-graceful-shutdown 6
 
 # The Compose service forwards the same setting into the container.
-AI_SYSTEMS_LAB_MODE=public-demo docker compose -f infrastructure/docker-compose.yml up --build
+AI_SYSTEMS_LAB_MODE=public-demo UVICORN_PROXY_HEADERS=false \
+  UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN=6 \
+  docker compose -f infrastructure/docker-compose.yml up --build
 ```
 
 In `public-demo` mode the application constructs and registers **only MockProvider**.
@@ -123,7 +126,7 @@ For a future Render deployment, supply `AI_SYSTEMS_LAB_MODE=public-demo` as a
 service environment variable before startup. The Docker image accepts this
 variable at runtime. Keep real provider credentials out of public deployments.
 This mode enforces mock-only inference, admission budgets, inference deadlines,
-and the HTTP ingress policy below. Rate limiting and deployment remain separate work.
+and the HTTP body and request-frequency policies below. Deployment remains separate work.
 
 ### Public-demo HTTP ingress
 
@@ -167,16 +170,81 @@ separate. No reader tasks are spawned, and the original disconnect channel remai
 available to SSE after the accepted body is replayed.
 
 The public playground uses same-origin URLs, so public mode grants **no cross-origin
-CORS permissions**. Cross-origin preflights receive 405 and responses have no
+CORS permissions**. Rate-admitted cross-origin preflights receive 405 and responses have no
 `Access-Control-Allow-Origin` or credential permission headers. Same-origin HTTP
 and SSE continue normally. CORS controls browser response access; it is not
 authentication and does not prevent direct HTTP clients from calling the API.
 
 This is a per-request body bound, not a total process-memory or connection budget.
-Upload deadlines, aggregate ingress concurrency, header limits, and per-client rate
-limits are not supplied by this middleware. HTTP wire framing is handled by the
+Upload deadlines, aggregate ingress concurrency, and header limits are not supplied
+by the body middleware. Request frequency is handled separately below. HTTP wire framing is handled by the
 ASGI server. Keep the demo undeployed until the remaining public-safety gates are
 complete. See [ADR 0008](system-design/adr/0008-public-http-ingress.md).
+
+### Public-demo request-rate limits
+
+| Startup environment variable | Default | Allowed range |
+|---|---:|---|
+| `AI_SYSTEMS_LAB_RATE_BURST` | 60 requests | Integer 1–120 |
+| `AI_SYSTEMS_LAB_RATE_REFILL_PER_S` | 2 tokens/second | Finite number 0.01–10 |
+| `AI_SYSTEMS_LAB_RATE_MAX_CLIENTS` | 1024 buckets | Integer 1–4096 |
+
+Invalid/empty settings fail public startup without echoing values. Developer mode
+ignores these settings and installs no rate limiter. Each process has its own
+single-event-loop token buckets, using monotonic time; workers and instances do
+not share limits. This is application throttling, not distributed quotas or an
+anti-DDoS guarantee.
+
+Every HTTP request costs one token, except **exact `GET /health`**. This includes
+completions, SSE, retrieval, metrics, the playground/docs, preflights, unknown paths,
+cache hits, and SingleFlight joiners. A batch costs one HTTP token, not one token
+per member; existing batch-size and inference-admission limits still account for
+its downstream work. The playground benchmark submits 50 HTTP requests and costs
+50 tokens; the default permits one such burst with room for ordinary interactions.
+Rapid repeats may be throttled. No automatic retry loops are introduced.
+
+Rate admission runs before body reading, then the body limit, model validation,
+and execution admission. A rate-admitted request still costs its token if it later
+receives 400/413/422/503/504 or disconnects. Existing accepted work is never evicted
+or cancelled by the rate limiter. `GET /health` remains protected by the body limit
+and only checks public MockProvider health; it cannot run inference or retrieval.
+
+Exhaustion returns HTTP **429**, including before headers on rejected SSE requests:
+`{"error":{"code":"rate_limited","message":"Too many requests"}}`.
+For a depleted known bucket, `Retry-After` is the positive integer ceiling of time
+needed to refill one token. It is an earliest-availability hint; competing requests
+can consume that token. Registry-capacity and unsafe-identity rejections omit the
+header because no reliable retry time is known. Rejections read no body, parse no
+JSON, and do not register inference work or update inference success/error metrics.
+
+Buckets use canonical IP bytes, ignoring source ports; equivalent IPv6 forms and
+IPv4-mapped IPv6 addresses share quotas. Missing/malformed identities share one
+fallback bucket within the same registry cap. Fixed-size keys and a bounded
+ordered registry prevent identity-state growth. Entries are reclaimed only when
+fully replenished and idle for `max(60 seconds, burst/refill)`. Active clients are
+never evicted to make room. If no safe slot exists, a new identity receives 429.
+Checks are synchronous within one event loop, without locks, waiters, or tasks.
+
+**Client identity and proxy policy:** run the public uvicorn CLI with
+`--no-proxy-headers` (or `UVICORN_PROXY_HEADERS=false`). The application never uses
+forwarding-header values to choose buckets. Installed uvicorn can rewrite the ASGI
+client from `X-Forwarded-For` when proxy-header processing is enabled. Its rewritten
+form `(forwarded_host, 0)` plus that header is rejected conservatively with 429;
+the actual peer cannot be recovered at the application layer. This safeguard is
+specific to the inspected uvicorn behavior, not a proxy-trust framework.
+
+```bash
+AI_SYSTEMS_LAB_MODE=public-demo uvicorn backend.main:app \
+  --no-proxy-headers --timeout-graceful-shutdown 6
+```
+
+Programmatic servers must pass `proxy_headers=False` explicitly; the uvicorn CLI
+environment option is not an application-mode switch. Behind Render, another proxy,
+or NAT, users may share a connection-peer bucket. Verify actual trusted-address
+behavior before claiming per-user or end-client-IP fairness. Disabling proxy headers
+also affects forwarded scheme handling, so external URL/redirect behavior needs
+deployment verification. Do not enable wildcard forwarded-header trust to obtain
+apparent per-user quotas. See [ADR 0009](system-design/adr/0009-public-request-rate-limits.md).
 
 ### Public-demo admission budgets
 
@@ -277,6 +345,7 @@ public profile start it with:
 
 ```bash
 AI_SYSTEMS_LAB_MODE=public-demo UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN=6 \
+  UVICORN_PROXY_HEADERS=false \
   docker compose -f infrastructure/docker-compose.yml up --build
 ```
 
@@ -357,7 +426,7 @@ without trimming. Lengths count characters, not bytes or model tokens.
 
 Pydantic validates completions, messages, and every explicit batch member before
 the endpoint runs. FastAPI validates retrieval parameters before search. Invalid
-requests return HTTP 422, including on the streaming endpoint before SSE starts.
+requests that pass HTTP ingress return HTTP 422, including on the streaming endpoint before SSE starts.
 One invalid batch member rejects the entire HTTP batch without executing any of
 its members. Direct construction of these Pydantic request models also validates
 their inputs. Success response schemas and generation-parameter bounds are unchanged.
@@ -365,8 +434,8 @@ their inputs. Success response schemas and generation-parameter bounds are uncha
 The limits accommodate the quickstart and playground while bounding individual
 application inputs. The explicit HTTP batch limit is separate from micro-batcher
 queue capacity and the public HTTP body-byte budget. Public-demo admission and
-deadline policies are described above; per-client rate limiting remains separate
-work. Direct use of the retrieval library is not governed by HTTP query constraints.
+deadline and HTTP request-rate policies are described above. Direct use of the
+retrieval library is not governed by HTTP query constraints.
 
 ## Benchmark Summary
 
