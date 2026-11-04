@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from backend.admission import AdmissionRejected
-from backend.config import build_admission, build_providers
+from backend.config import build_admission, build_body_limit, build_providers
 from backend.deadlines import (
     InferenceDeadlineExceeded,
     ShutdownIncomplete,
@@ -38,6 +38,7 @@ from backend.deadlines import (
     settled,
 )
 from backend.gateway import Gateway, NoProviderAvailable
+from backend.ingress import BodyLimitMiddleware
 from backend.models import (
     BatchCompletionRequest,
     BatchCompletionResponse,
@@ -52,6 +53,7 @@ _START_TIME = time.monotonic()
 _STATIC_DIR = Path(__file__).parent / "static"
 
 # Enforce the application mode before any live provider can be constructed.
+_MAX_BODY_BYTES = build_body_limit()
 gateway = Gateway(providers=build_providers(), admission=build_admission())
 
 # Pre-seeded RAG knowledge base for interactive exploration
@@ -115,12 +117,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if _MAX_BODY_BYTES is None:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # The public playground is same-origin; grant no cross-origin permissions.
+    app.add_middleware(BodyLimitMiddleware, max_body_bytes=_MAX_BODY_BYTES)
 
 
 @app.exception_handler(AdmissionRejected)

@@ -1,4 +1,4 @@
-"""Application provider selection, evaluated once when the server imports main."""
+"""Application configuration, evaluated once when the server imports main."""
 
 from __future__ import annotations
 
@@ -7,6 +7,30 @@ import os
 
 from backend.admission import AdmissionBudget
 from backend.providers import AnthropicProvider, MockProvider, OpenAIProvider, Provider
+
+DEFAULT_MAX_BODY_BYTES = 262144
+MAX_CONFIGURED_BODY_BYTES = 1048576
+
+
+def build_body_limit() -> int | None:
+    """Bound public HTTP parsing; developer mode preserves existing behavior."""
+    mode = os.environ.get("AI_SYSTEMS_LAB_MODE", "developer")
+    if mode == "developer":
+        return None
+    if mode != "public-demo":
+        raise ValueError("AI_SYSTEMS_LAB_MODE must be 'developer' or 'public-demo'")
+    try:
+        raw = os.environ.get("AI_SYSTEMS_LAB_MAX_BODY_BYTES", str(DEFAULT_MAX_BODY_BYTES))
+        if not raw.isascii() or not raw.isdecimal():
+            raise ValueError
+        value = int(raw)
+        if not 1 <= value <= MAX_CONFIGURED_BODY_BYTES:
+            raise ValueError
+        return value
+    except ValueError:
+        raise ValueError(
+            "AI_SYSTEMS_LAB_MAX_BODY_BYTES must be an integer between 1 and 1048576"
+        ) from None
 
 
 def build_providers() -> list[Provider]:
