@@ -96,11 +96,14 @@ class CircuitBreaker(Generic[T]):
             raise
         finally:
             if is_half_open_probe:
-                await self._release_half_open_probe()
+                self._release_half_open_probe()
 
-    async def _release_half_open_probe(self) -> None:
-        async with self._lock:
-            self._half_open_probe_in_flight = False
+    def _release_half_open_probe(self) -> None:
+        # Only the probe owner releases, after fn() has returned or unwound.
+        # This single-event-loop assignment cannot interleave with admission's
+        # non-suspending locked section. Awaiting the lock here would allow a
+        # second cancellation to strand the permit after the provider stopped.
+        self._half_open_probe_in_flight = False
 
     async def _on_success(self) -> None:
         async with self._lock:
